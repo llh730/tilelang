@@ -745,6 +745,10 @@ def macro(func: Callable[_P, _T] = None) -> Macro[_P, _T]:
 from typing import _eval_type
 
 
+# 该函数解决了两个问题：
+# 1. 闭包中的变量引用问题，可以看下面给的代码注释，当n是一个父函数的局部变量时，在子函数内看不到该定义，就会报not defined错误。
+# 这个函数通过get_func_nonlocals强行把n放到了局部命名空间。
+# 2. TVM特有字符串问题比如T.float32，他会通过_eval_type，将其转换为tvm中对应的对象。
 def get_type_hints(func):
     annot = getattr(func, "__annotations__", None)
     if annot is None:

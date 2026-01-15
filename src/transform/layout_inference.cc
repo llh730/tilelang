@@ -44,6 +44,7 @@ using namespace tir;
  */
 class ThreadBindingCollector : public StmtExprVisitor {
 public:
+  // 收集全部的thread_binding信息。
   void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tir::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
@@ -111,6 +112,7 @@ public:
            "required for layout inference.";
 
     // Run InferLayout
+    // 调用不同算子的InferLayout函数，得到更新后的layout_map。
     auto updates = next->InferLayout(LayoutInferArgs{target_,
                                                      thread_bounds,
                                                      layout_map,
@@ -127,6 +129,7 @@ public:
       ICHECK(layout.defined()) << "InferLayout returned an undefined layout.";
 
       // Helper: propagate inferred layout to alias buffers (same data Var)
+      // 判断这个buffer的底层数据指针是否存在别名，或者说多个变量指向同一个内存地址。
       auto propagate_alias = [&](const Buffer &src_buffer,
                                  const Layout &src_layout) {
         if (!buffer_data_to_buffers_.count(src_buffer->data))
@@ -135,6 +138,7 @@ public:
         for (const auto &sib : siblings) {
           if (sib.same_as(src_buffer))
             continue;
+          // 判断 src_layout能否直接用在sib上，通常需要reshape比如从[128]变为[32,4]
           bool shapes_equal =
               src_layout->InputShape().size() == sib->shape.size();
           if (shapes_equal) {
@@ -152,6 +156,7 @@ public:
                   : src_layout->Reshape(sib->shape, &analyzer_,
                                         Integer(src_buffer->dtype.bytes()),
                                         Integer(sib->dtype.bytes()));
+          // 如果别名已有其他布局，检查是否冲突
           if (layout_map.count(sib)) {
             ICHECK(target_layout->IsEqual(layout_map[sib].get()))
                 << "Get different layout for alias buffer " << sib
@@ -159,6 +164,7 @@ public:
                 << ")\n current: " << target_layout->DebugOutput()
                 << "\n previous: " << layout_map[sib]->DebugOutput();
           } else {
+            // 如果没有布局，添加布局。
             layout_map.Set(sib, target_layout);
             if (update_queue && use_list_.count(sib)) {
               for (int idx : use_list_[sib]) {
@@ -169,6 +175,7 @@ public:
         }
       };
 
+      // 如果在先前的步骤中已经给这个buffer添加了布局 
       if (layout_map.count(buffer)) {
         // If new layout contains the old one, update map
         if (IsFragmentBuffer(buffer) && level != InferLevel::kStrict &&
@@ -200,10 +207,12 @@ public:
                 dst_layout->InputShape()[i] - src_layout->InputShape()[i])));
             inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
           }
+          // 如果旧布局包含新的布局，就改为使用新的布局。
           if (ProveFragmentContains(src_layout, dst_layout, indices, indices,
                                     inner_analyzer)) {
             layout_map.Set(buffer, layout);
             // Propagate to alias buffers as well
+            // 其他别名也都更改布局
             propagate_alias(buffer, layout);
             continue;
           }
@@ -312,6 +321,7 @@ public:
     // step 0: set fully replicated layout for floating fragment buffers
     // Floating buffers are accessed outside TileOps (e.g., in if conditions),
     // so they must be replicated across all threads.
+    // 考虑在TileOp之外情况使用到的fragment buffer，比如if(mask[i])，没有办法判断这种变量怎么布局切分，就只能让每个线程有一份完整的拷贝。
     for (const auto &[buffer, thread_bounds] : floating_fragment_buffers_) {
       if (layout_map.count(buffer))
         continue;
@@ -322,6 +332,7 @@ public:
 
     // step 1: infer strict layout
     for (int i = 0; i < num_infer; i++) {
+      // 推断所有要求strict layout地方的位置
       RunInferStep(i, InferLevel::kStrict, false, layout_map, strict_layout_map,
                    q, in_queue);
     }
@@ -331,6 +342,7 @@ public:
     }
 
     // step 2: infer common layout with BFS
+    // 通过BFS不断更新layout
     FinishInferQueue(InferLevel::kCommon, layout_map, strict_layout_map, q,
                      in_queue);
     // step 3: relax constraints to free and re-run
@@ -465,6 +477,7 @@ private:
 
   // Enqueue idx to q with priority if all its buffers already
   // have layouts. Also guards against duplicates and self-enqueue.
+  // 当更新了一个buffer的layout时，要考虑更新其他OP的这个buffer layout的关系，就要将op加入到对应的队列q中去。
   void EnqueueWithPriority(int idx, std::deque<int> &q,
                            std::vector<bool> &in_queue, int cur_infer_id,
                            const LayoutMap &layout_map) const {
@@ -488,8 +501,10 @@ private:
     if (op->op.as<GlobalVarNode>())
       return;
 
+    // 判断是不是预定义的Operator，由（TIR_REGISTER_TL_TILE_OP）注册的Operator。如果不是预定义的Operator不用做处理。
     auto p = ParseOperator(tvm::ffi::GetRef<Call>(op));
     if (p.defined()) {
+      // 遍历Call Node的Args，如果Args中有Buffer，则加入到use_list_中。
       for (const auto &arg : op->args) {
         if (auto buffer = getBufferFromAccessPtr(arg)) {
           addToUseList(buffer.value());
@@ -499,6 +514,7 @@ private:
         // Check if the argument uses any LetStmt variables that reference
         // fragment buffers. If so, add those buffers to the use list.
         // This handles cases like: a = block_mask_f[i]; T.copy(A[a, 0], ...)
+        // 防止因为使用了LetStmt变量导致fragment布局错过优化机会。
         CollectFragmentBuffersFromExpr(arg);
       }
       // Compute thread_var_ and thread_bounds_
@@ -509,6 +525,7 @@ private:
         auto max_value = const_int_bound->max_value;
         auto extent = max_value - min_value + 1;
         auto dtype = thread_var_->var.dtype();
+        // 判断有多少个线程在并行运行 用法：for i in T.thread_binding(0, 128, thread="threadIdx.x"):
         thread_bounds_vec_.push_back(Range::FromMinExtent(
             IntImm(dtype, min_value), IntImm(dtype, extent)));
       } else {
@@ -516,7 +533,7 @@ private:
       }
       analyzer_vec_.push_back(analyzer_.Clone());
 
-      // Compute buffer oob for each buffer in the op
+      // Compute buffer oob for each buffer in the op. Buffer越界检查
       if (const auto *copy = p.as<CopyNode>()) {
         auto src_tensor = copy->src;
         auto dst_tensor = copy->dst;
@@ -551,6 +568,7 @@ private:
     }
   }
 
+// 统计一个Expr中有多少个fragment buffer。还要考虑TVM access ptr的问题。
   Optional<Buffer> getBufferFromAccessPtr(const PrimExpr &expr) {
     if (auto bl = expr.as<BufferLoadNode>()) {
       return bl->buffer;
@@ -590,6 +608,7 @@ private:
     return std::nullopt;
   }
 
+  // 将infer_list和use_list对应起来，infer_list存储的是OP的处理顺序，use_list记录了当前这个Buffer被infer_list中的哪些OP使用过。
   void addToUseList(const Buffer &buffer) {
     // buffer scope must be local.fragment
     if (!IsFragmentBuffer(buffer)) {
@@ -618,15 +637,18 @@ private:
   void VisitStmt_(const ForNode *op) final {
     if (op->kind == ForKind::kParallel) {
       auto infer = ParallelOp(tvm::ffi::GetRef<For>(op));
+      // TODO: 阅读ParallelOp实现，在这里他会分析循环使用索引使用的Buffer，然后将其加入use_list_。
       for (const auto &[buffer, _] : infer->GetIndiceMap()) {
         addToUseList(buffer);
       }
+
 
       PostOrderVisit(op->body, [this](const ObjectRef &node) {
         if (auto *buffer_load = node.as<BufferLoadNode>()) {
           if (buffer_load->buffer.defined() &&
               buffer_load->buffer->data.defined()) {
             if (buffer_data_to_buffers_.count(buffer_load->buffer->data)) {
+              // 寻找指向同一个内存的多个Buffer（别名）buffer->data指向开始内存地址
               // Check if this buffer is already in the list
               auto buffers = buffer_data_to_buffers_[buffer_load->buffer->data];
               bool found = false;
@@ -686,6 +708,7 @@ private:
           }
         }
       });
+      // 记录当前Op的信息，同CallNode记录ParallelOp相关信息。
       infer_list_stmt_.push_back(tvm::ffi::GetRef<ObjectRef>(op));
       infer_list_.push_back(std::move(infer));
       thread_var_vec_.push_back(thread_var_);
@@ -725,6 +748,7 @@ private:
     // After visiting, apply layouts to all collected buffers
     if (op->annotations.count(attr::kLayoutMap)) {
       // Check if the layout map is Map<Var, Layout>
+      // 获取在layout_reducer中创建的layoutmap，跟buffer形状做对齐，然后将其加入到annotated_layout_map_。
       auto map =
           op->annotations.Get(attr::kLayoutMap)->as<Map<Var, Layout>>().value();
       for (const auto &[var, layout] : map) {
@@ -1010,6 +1034,7 @@ private:
     DLOG(INFO) << '\n';
 
     // Group operators into connected components
+    // 使用并查集来处理，如果A和B共享一个Buffer，那他们就要一起解决，放在一个集合中。
     UnionFind<int> uf;
     for (int i = 0; i < infer_list_.size(); i++) {
       uf.MakeSet(i);
@@ -1027,6 +1052,7 @@ private:
     // Additionally, union across buffers that share the same underlying
     // buffer->data (Var). This handles cases like reshape where multiple
     // Buffer objects alias the same storage.
+    // 如果两个buffer的data是同一个Var，那他们也要一起解决。
     for (const auto &[var, buffers] : buffer_data_to_buffers_) {
       std::vector<int> merged;
       for (const auto &buf : buffers) {
@@ -1052,6 +1078,7 @@ private:
       components[root].push_back(i);
     }
     // Create a map from root to buffers
+    // 将并查集结果转换为map。
     std::unordered_map<int, std::vector<Buffer>> components_buffers;
     for (const auto &[buffer, infer_indices] : use_list_) {
       int root = uf.Find(infer_indices[0]);
@@ -1074,6 +1101,7 @@ private:
       int min_reg_num_infer_root = -1;
 
       // Try each member as the root of inference for this component
+      // 在同一个component中找不同的root作为布局起点，
       for (int attempt_infer_root : members) {
         DLOG(INFO) << "----------------------- try root " << attempt_infer_root
                    << " members " << members.size() << '\n';
@@ -1115,6 +1143,7 @@ private:
 
         if (do_update) {
           // Compute the total register number for this layout
+          // 评估当前布局的寄存器使用量
           int64_t reg_num = 0;
           for (const auto &[buffer, layout] : tmp_layout_map) {
             if (auto frag = layout.as<Fragment>()) {
@@ -1162,6 +1191,7 @@ public:
   static PrimFunc Substitute(PrimFunc f, bool skip_thread_partition = false) {
     arith::Analyzer analyzer;
     PrimFuncNode *fptr = f.CopyOnWrite();
+    // 做了一下循环的合并
     fptr->body = ParallelLoopFuser::Fuse(f->body);
     BufferUseDefCollector collector(skip_thread_partition);
     collector.Collect(f);
@@ -1377,6 +1407,7 @@ private:
 tvm::transform::Pass LayoutInference() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
+    // 并行循环增加判断条件。
     f.CopyOnWrite()->body = ParallelLoopTransformer::Substitute(f->body);
     ThreadBindingCollector collector;
     collector(f->body);

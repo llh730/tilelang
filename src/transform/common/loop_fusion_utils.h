@@ -41,6 +41,7 @@ namespace tl {
 using namespace tir;
 using arith::IRMutatorWithAnalyzer;
 
+// 判断当前stmt是否使用过fragment 
 class FragmentAccessDetector : public StmtExprVisitor {
 public:
   FragmentAccessDetector() = default;

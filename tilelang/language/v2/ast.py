@@ -167,7 +167,7 @@ def eval_aug_assign(op: Operator, left: Any, sl: slice, right: Any) -> Any:
 
 class _empty: ...
 
-
+# 维护了一个最基本的python语义中间表示
 class BaseBuilder:
     empty = _empty
 

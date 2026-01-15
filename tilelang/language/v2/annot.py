@@ -652,6 +652,7 @@ class FuncAnnot:
         ker_arg_names = []
         for param in sig.parameters.values():
             name = param.name
+            # 获得这个函数参数的注释类型，如果没有写注释默认为静态类型
             annot = func_annots.get(name, Value("static", name))
             if not isinstance(annot, Annot):
                 if not isinstance(annot, type) and callable(annot):

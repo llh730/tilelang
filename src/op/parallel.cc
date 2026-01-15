@@ -56,9 +56,11 @@ bool ProveFragmentContains(Fragment small_frag, Fragment large_frag,
                        small_frag->ReplicateExtent()),
                  true); // Bind the replicate extent of small_frag.
   // Derive thread for small_frag.
+  // 根据当前布局，判断当前元素应该由哪个线程来访问
   auto thread = small_frag->ForwardThread(small_frag_indices, rep_small);
 
   // Get physical index and thread for large_frag.
+  // 找到给定索引的物理坐标
   auto large_frag_physical_and_thread = large_frag->Forward(large_frag_indices);
   // Add small_frag's thread to the large fragment's thread info.
   large_frag_physical_and_thread.push_back(thread);

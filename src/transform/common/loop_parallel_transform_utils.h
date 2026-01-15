@@ -81,6 +81,7 @@ public:
         // Collect the variables that used in the index
         std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> used_vars;
         // post order visit the index
+        // 对于当前这个buffer，判断一下索引用到的变量值，比如A[i*2+n]，用到i和n。
         PostOrderVisit(index, [&](const ObjectRef &obj) {
           if (const VarNode *v = obj.as<VarNode>()) {
             used_vars.insert(tvm::ffi::GetRef<Var>(v));

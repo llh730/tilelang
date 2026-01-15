@@ -66,6 +66,8 @@ wheel.py-api = "cp38"
 cmake.version = ">=3.26.1"
 build-dir = "build"
 
+cmake.build-type = "Debug"
+
 # editable.rebuild = true
 
 # Include backend and git info in version

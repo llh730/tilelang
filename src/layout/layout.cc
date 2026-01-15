@@ -21,6 +21,7 @@ namespace tl {
 
 using namespace tir;
 
+// 维护了一个全局的符号表，用于记录当前占位符和Var的对应关系
 static Var getPlaceholder(const std::string &s) {
   static std::unordered_map<std::string, Var> map;
   if (map.find(s) == map.end()) {
@@ -34,6 +35,8 @@ Var InputPlaceholder(size_t idx) {
   return getPlaceholder(std::string{'_', char('i' + idx)});
 }
 
+// 生成一个map，用于记录占位符在当前维度的取值范围。
+// 例如，对于输入尺寸为[10, 20, 30]，占位符为_i0，则生成的map为{_i0: [0, 10), _i1: [0, 20), _i2: [0, 30)}
 Map<Var, Range> LayoutNode::getVarMap() const {
   Map<Var, Range> map;
   for (size_t i = 0; i < InputDim(); i++) {
@@ -42,12 +45,15 @@ Map<Var, Range> LayoutNode::getVarMap() const {
   return map;
 }
 
+// 记录重复占位符的取值范围。
 Map<Var, Range> FragmentNode::getVarMap() const {
   auto map = LayoutNode::getVarMap();
   map.Set(ReplicationPlaceholder(), {0, ReplicateExtent()});
   return map;
 }
 
+// 构造函数，针对forward_index_中的表达式做Simplify。
+// forward_index记录的是逻辑坐标到物理坐标的映射公式比如有一个[4,8]的张量，那么物理存储与逻辑[i,j]的对应关系就是A_ptr[i*8+j]<=>A[i,j]
 LayoutNode::LayoutNode(Array<PrimExpr> input_size,
                        Array<PrimExpr> forward_index) {
   input_size_ = input_size;
@@ -56,7 +62,7 @@ LayoutNode::LayoutNode(Array<PrimExpr> input_size,
   forward_index_ = forward_index.Map(
       [&](const PrimExpr &e) { return analyzer.Simplify(e); });
 }
-
+// 构造函数，forward_var包含的就是每一个维度对应的变量名和范围，也就包含了input_size信息。
 Layout::Layout(Array<IterVar> forward_var, Array<PrimExpr> forward_index) {
   Map<Var, PrimExpr> vmap;
   Array<PrimExpr> input_size;
@@ -84,6 +90,8 @@ void LayoutNode::RegisterReflection() {
       .def("_DebugOutput", &LayoutNode::DebugOutput);
 }
 
+// 告诉分析器某个变量的取值范围，方便分析器利用这个信息简化数学表达或证明定理。
+// 获取当前布局占位符变量与范围，更新analyzer。
 void LayoutNode::UpdateAnalyzer(arith::Analyzer *analyzer) const {
   for (const auto &[var, dom] : getVarMap()) {
     analyzer->Bind(var, dom);
@@ -98,6 +106,7 @@ Array<PrimExpr> LayoutNode::GetForwardVars() const {
   return vars;
 }
 
+// 确定物理地址的范围，方便用来申请内存
 Array<PrimExpr> LayoutNode::OutputShape() const {
   Array<PrimExpr> ret(OutputDim(), 1);
   arith::Analyzer analyzer;
@@ -129,6 +138,8 @@ Array<PrimExpr> LayoutNode::OutputShape() const {
   return ret;
 }
 
+// 将forward_index中的占位符，替换为真实的物理变量：比如{ _i0 * 16 + _i1 } -> { row * 16 + col }
+// 如果只传入了N个变量，而一共有M个占位符，则只会替换后N个占位符信息。
 Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
   if (vars.empty())
     return forward_index_;
@@ -159,6 +170,11 @@ Array<PrimExpr> LayoutNode::Forward(const Array<PrimExpr> &vars) const {
   return result;
 }
 
+// 参数repeats记录了在每个维度上重复多少次
+// repeat_on_thread 参数负责是否增加线程来进行运算，比如从16*16的矩阵计算改为32*16的计算，
+//  如果该变量为true，就会将thread数量*2，
+//  如果为false，就会让每个thread多处理一个元素。
+// forward_thread_ 对应的是逻辑索引和处理他的线程之间的对应关系。
 Fragment FragmentNode::Repeat(const Array<PrimExpr> &repeats,
                               bool repeat_on_thread,
                               bool lower_dim_first) const {
@@ -167,10 +183,12 @@ Fragment FragmentNode::Repeat(const Array<PrimExpr> &repeats,
   Map<Var, PrimExpr> vmap;
   for (size_t i = 0; i < InputDim(); i++) {
     new_input_size.push_back(input_size_[i] * repeats[i]);
+    // 计算repeats之后的大坐标与repeats前的小坐标的对应关系，比如[i,j]从[4,2]变为[8,4]，则[i,j]就要变为[i%4,j%2]
     vmap.Set(InputPlaceholder(i),
              FloorMod(InputPlaceholder(i), InputShape()[i]));
   }
 
+  // repeat_index用于记录当前坐标究竟在第几个块上。
   PrimExpr repeats_index = 0, repeat_stride = 1;
   if (lower_dim_first) {
     for (int i = InputDim() - 1; i >= 0; i--) {
@@ -186,25 +204,36 @@ Fragment FragmentNode::Repeat(const Array<PrimExpr> &repeats,
     }
   }
 
+  // DLOG(INFO)<<"OutputShape"<<OutputShape()<<"\n";
+  // DLOG(INFO)<<"InputShape"<<InputShape()<<"\n";
+  // DLOG(INFO)<<"repeats"<<repeats<<"\n";
+  // DLOG(INFO)<<"repeats_index"<<repeats_index<<"\n";
+  // repeat_on_thread就是每重复几次，就多交给几个warp来完成这个工作，所以每个warp的thread都和repeat后的矩阵大小一一对应，
+  // 所以在new_forward_thread之后要+ thread_size* repeats_index.
   if (repeat_on_thread) {
     PrimExpr thread_size = ThreadExtent();
     auto new_forward_index = forward_index_.Map(
         [&](const PrimExpr &e) { return Substitute(e, vmap); });
     auto new_forward_thread =
         Substitute(forward_thread_, vmap) + thread_size * repeats_index;
+    // DLOG(INFO)<<"new_forward_thread"<<new_forward_thread<<"\n";
     return Fragment(new_input_size, new_forward_index, new_forward_thread,
                     replicate_size_, std::nullopt);
   } else {
+    // 这种情况下是每个thread多了repeats倍的工作量。
     ICHECK(OutputDim() == 1);
     PrimExpr frag_len = OutputShape()[0];
     Array<PrimExpr> new_forward_index = {Substitute(forward_index_[0], vmap) +
                                          frag_len * repeats_index};
+    // DLOG(INFO)<<"forward_thread"<<forward_thread_<<"\n";
     PrimExpr new_forward_thread = Substitute(forward_thread_, vmap);
+    // DLOG(INFO)<<"new_forward_thread"<<new_forward_thread<<"\n";
     return Fragment(new_input_size, new_forward_index, new_forward_thread,
                     replicate_size_, std::nullopt);
   }
 }
 
+// 制造数据的备份，让不同的线程来处理。
 Fragment FragmentNode::Replicate(int repeats) const {
   ICHECK(repeats >= 1);
   Map<Var, PrimExpr> vmap;
@@ -638,7 +667,6 @@ PrimExpr FragmentNode::ForwardThread(const Array<PrimExpr> &vars,
   }
   if (rep_var.defined())
     vmap.Set(ReplicationPlaceholder(), rep_var.value());
-
   return Substitute(forward_thread_, vmap);
 }
 

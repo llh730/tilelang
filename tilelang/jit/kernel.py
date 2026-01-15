@@ -121,8 +121,8 @@ class JITKernel(Generic[_P, _T]):
 
             assert get_cplus_compiler() is not None, "Cython backend requires a C++ compiler, please install or use other backends."
 
-        if from_database:
-            return
+        # if from_database:
+        #     return
 
         # Print log on compilation starts
         # NOTE(Chenggang): printing could let the training/inference framework easier to know

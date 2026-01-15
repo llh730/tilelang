@@ -28,7 +28,6 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
 def main():
     kernel = matmul(1024, 1024, 1024, 128, 128, 32)
-
     import torch
 
     a = torch.randn(1024, 1024).cuda().half()
@@ -37,18 +36,17 @@ def main():
     c = kernel(a, b)
 
     ref_c = a @ b
-
-    print("c:")
-    print(c)
-    print("ref_c:")
-    print(ref_c)
+    # print("c:")
+    # print(c)
+    # print("ref_c:")
+    # print(ref_c)
 
     torch.testing.assert_close(c, ref_c, rtol=1e-2, atol=1e-2)
-    print("All check passed.")
+    # print("All check passed.")
 
-    # Get CUDA Source
-    print("CUDA Source:")
-    print(kernel.get_kernel_source())
+    # # Get CUDA Source
+    # print("CUDA Source:")
+    # print(kernel.get_kernel_source())
 
     # benchmark
     profiler = kernel.get_profiler()
